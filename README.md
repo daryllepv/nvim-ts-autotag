@@ -48,7 +48,8 @@ require('nvim-ts-autotag').setup({
     -- Defaults
     enable_close = true, -- Auto close tags
     enable_rename = true, -- Auto rename pairs of tags
-    enable_close_on_slash = false -- Auto close on trailing </
+    enable_close_on_slash = false, -- Auto close on trailing </
+    enable_self_close = false -- Self-close empty JSX/XML tags when typing /
   },
   -- Also override individual filetype configs, these take priority.
   -- Empty by default, useful if one of the "opts" global settings
@@ -64,6 +65,35 @@ require('nvim-ts-autotag').setup({
 > [!CAUTION]
 > If you are setting up via `nvim-treesitter.configs` it has been deprecated! Please migrate to the
 > new way. It will be removed in `1.0.0`.
+
+### Self-closing tags
+
+Set `enable_self_close = true` to complete an opening JSX or XML tag with ` />` when typing `/`.
+In the examples below, `|` marks the insertion point.
+
+```text
+Before                          Input   After
+-------------------------------------------------------------
+<div|                           /       <div />|
+<div|></div>                     /       <div />|
+<div className="x"|></div>        /       <div className="x" />|
+-------------------------------------------------------------
+```
+
+Attributes are preserved. Only strictly empty paired elements are converted; text, children, and whitespace between tags
+prevent conversion. Ordinary HTML tags are not converted.
+
+The option is independent of `enable_close` and `enable_close_on_slash`, and can also be enabled per filetype:
+
+```lua
+require('nvim-ts-autotag').setup({
+  per_filetype = {
+    ["typescriptreact"] = { enable_self_close = true },
+    ["javascriptreact"] = { enable_self_close = true },
+    ["xml"] = { enable_self_close = true },
+  }
+})
+```
 
 ### A note on lazy loading
 
