@@ -65,6 +65,7 @@ function M.setup_treesitter()
         sync_install = true,
         ensure_installed = {
             "html",
+            "xml",
             "javascript",
             "typescript",
             "svelte",

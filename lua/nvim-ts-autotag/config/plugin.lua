@@ -133,10 +133,12 @@ end
 ---@field enable_rename boolean? Whether or not to auto rename paired tags
 ---@field enable_close boolean? Whether or not to auto close tags
 ---@field enable_close_on_slash boolean? Whether or not to auto close tags when a `/` is inserted
+---@field enable_self_close boolean? Convert empty JSX/XML tags to self-closing tags when `/` is inserted
 local Opts = {
     enable_rename = true,
     enable_close = true,
     enable_close_on_slash = false,
+    enable_self_close = false,
 }
 
 ---@class nvim-ts-autotag.PluginSetup

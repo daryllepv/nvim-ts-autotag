@@ -278,6 +278,203 @@ M.close_slash_tag = function()
     end
 end
 
+local self_close_languages = { "javascript", "tsx", "xml" }
+local self_close_attributes = { "jsx_attribute", "jsx_expression", "Attribute" }
+
+local function whitespace_between(bufnr, row, col, end_row, end_col)
+    local text = vim.api.nvim_buf_get_text(bufnr, row, col, end_row, end_col, {})
+    return table.concat(text, "\n"):match("^%s*$") ~= nil
+end
+
+local function check_self_close_tag(bufnr)
+    local ts_tag = buffer_tag[bufnr]
+    if not ts_tag then
+        return false
+    end
+    local row, col = utils.get_cursor()
+    local line = vim.api.nvim_get_current_line()
+    -- A slash can only replace the end of an opening tag, not text in its middle.
+    local suffix = line:sub(col + 1)
+    local at_tag_end = suffix:match("^%s*>") or suffix:match("^%s*$")
+    -- Trailing whitespace may lie outside an unfinished tag's syntax node.
+    local node_col = line:sub(1, col):find("%S%s*$")
+    if not node_col or line:sub(node_col, node_col) == "<" or not (at_tag_end or suffix:match("^%s*[)%]},;]")) then
+        return false
+    end
+    local ok, buf_parser = pcall(vim.treesitter.get_parser, bufnr)
+    if not ok or not buf_parser or not is_in_table(self_close_languages, buf_parser:lang()) then
+        return false
+    end
+    local range = { row, node_col - 1, row, node_col }
+    -- Only resolve injections around the insertion point, not throughout the buffer.
+    buf_parser:parse(range)
+    local language = buf_parser:language_for_range(range)
+    if not is_in_table(self_close_languages, language:lang()) then
+        return false
+    end
+    local node = language:named_node_for_range(range)
+    while node do
+        if
+            is_in_table(ts_tag.start_tag_pattern, node:type())
+            or node:type() == "EmptyElemTag"
+            or node:type() == "jsx_self_closing_element"
+            or node:type() == "ERROR"
+        then
+            break
+        end
+        node = node:parent()
+    end
+    if not node then
+        return false
+    end
+
+    -- JSX can recover an unfinished tag with a missing delimiter. A following
+    -- sibling may even become its type arguments and supply an unrelated end tag.
+    local delimiter = (node:type() == "jsx_self_closing_element" or node:type() == "jsx_opening_element")
+        and node:child(node:child_count() - 1)
+    local missing_close = delimiter and delimiter:type() == "/>" and delimiter:missing()
+    local missing_open = delimiter and delimiter:type() == ">" and delimiter:missing()
+    if not at_tag_end and not missing_close then
+        return false
+    end
+
+    -- Incomplete JSX tags are direct children of ERROR nodes. XML may instead
+    -- produce an EmptyElemTag with a missing '/>' token. Validate their actual
+    -- tokens rather than interpreting arbitrary '<' text as markup.
+    local child = node:child(0)
+    if node:type() == "ERROR" then
+        -- Error nodes can span thousands of unrelated tokens. Locate the child
+        -- before the cursor, then walk back only through this tag's name/attributes.
+        local first, last = 0, node:child_count() - 1
+        local index
+        while first <= last do
+            local middle = math.floor((first + last) / 2)
+            local sr, sc = node:child(middle):range()
+            if sr < row or (sr == row and sc < col) then
+                index = middle
+                first = middle + 1
+            else
+                last = middle - 1
+            end
+        end
+        child = index and node:child(index)
+        while child and child:type() ~= "<" do
+            local kind = child:type()
+            if
+                not is_in_table(ts_tag.start_name_tag_pattern, kind)
+                and not is_in_table(self_close_attributes, kind)
+                and kind ~= "jsx_namespace_name"
+            then
+                return false
+            end
+            child = child:prev_sibling()
+        end
+    end
+    local name, last, started
+    while child do
+        local sr, sc, er, ec = child:range()
+        local kind = child:type()
+        if sr > row or (sr == row and sc >= col) then
+            -- A slash in the middle of a real tag must not strand its attributes.
+            -- Missing '>' recovery can mistake a subsequent tag for type arguments.
+            if
+                node:type() ~= "ERROR"
+                and (is_in_table(self_close_attributes, kind) or (kind == "type_arguments" and not missing_open))
+            then
+                return false
+            end
+            break
+        end
+        if (missing_close or missing_open) and child:missing() and (kind == "/>" or kind == ">") then
+            break
+        end
+        if kind == "<" then
+            started, name, last = true, nil, child
+        elseif started then
+            if er > row or (er == row and ec > col) or child:has_error() then
+                return false
+            end
+            if not name and (is_in_table(ts_tag.start_name_tag_pattern, kind) or kind == "jsx_namespace_name") then
+                local _, _, marker_row, marker_col = last:range()
+                if marker_row ~= sr or marker_col ~= sc then
+                    return false
+                end
+                name = child
+            elseif name and kind == "identifier" and node:type() == "ERROR" and language:lang() ~= "xml" then
+                -- An unfinished JSX boolean attribute has no jsx_attribute wrapper.
+                local _, _, previous_row, previous_col = last:range()
+                if
+                    (previous_row == sr and previous_col == sc)
+                    or not whitespace_between(bufnr, previous_row, previous_col, sr, sc)
+                then
+                    return false
+                end
+            elseif not name or not is_in_table(self_close_attributes, kind) then
+                started = false
+            end
+            last = child
+        end
+        child = child:next_sibling()
+    end
+    if not started or not name or not last then
+        return false
+    end
+    local _, _, end_row, end_col = last:range()
+    if not whitespace_between(bufnr, end_row, end_col, row, col) then
+        return false
+    end
+
+    local trailing_space = suffix:match("^(%s*)>") or ""
+    local replace_end = col + #(suffix:match("^%s*>") or "")
+    local parent = node:parent()
+    if
+        parent
+        and is_in_table(ts_tag.element_tag, parent:type())
+        and node:type() ~= "EmptyElemTag"
+        and not missing_close
+        and not missing_open
+    then
+        -- An empty element's closing tag must be the very next sibling.
+        local closing = node:next_named_sibling()
+        if not closing or not is_in_table(ts_tag.end_tag_pattern, closing:type()) or closing:has_error() then
+            return false
+        end
+        local _, _, open_row, open_col = node:range()
+        local close_row, close_col, finish_row, finish_col = closing:range()
+        -- Never remove content, even whitespace, or guess which end tag matches.
+        if open_row ~= close_row or open_col ~= close_col or finish_row ~= row then
+            return false
+        end
+        local closing_name = closing:named_child(0)
+        if
+            not closing_name
+            or vim.treesitter.get_node_text(name, bufnr) ~= vim.treesitter.get_node_text(closing_name, bufnr)
+        then
+            return false
+        end
+        replace_end = finish_col
+    elseif not missing_close and not missing_open and node:type() ~= "ERROR" and node:next_named_sibling() then
+        -- A malformed, unpaired element can still contain text or children.
+        return false
+    end
+
+    local space = trailing_space
+    if space == "" and not line:sub(col, col):match("%s") then
+        space = " "
+    end
+    return true, row, col, replace_end, space .. "/>"
+end
+
+M.self_close_tag = function()
+    local bufnr = vim.api.nvim_get_current_buf()
+    local result, row, col, replace_end, replacement = check_self_close_tag(bufnr)
+    if result then
+        vim.api.nvim_buf_set_text(bufnr, row, col, row, replace_end, { replacement })
+        vim.api.nvim_win_set_cursor(0, { row + 1, col + #replacement })
+    end
+    return result
+end
+
 local function replace_text_node(node, tag_name)
     if node == nil then
         return
@@ -481,11 +678,15 @@ M.attach = function(bufnr)
                 buffer = bufnr,
             })
         end
-        if Setup.get_opts(vim.bo.filetype).enable_close_on_slash then
+        local opts = Setup.get_opts(vim.bo.filetype)
+        if opts.enable_close_on_slash or opts.enable_self_close then
             vim.keymap.set("i", "/", function()
+                if opts.enable_self_close and M.self_close_tag() then
+                    return
+                end
                 local row, col = unpack(vim.api.nvim_win_get_cursor(0))
                 vim.api.nvim_buf_set_text(bufnr, row - 1, col, row - 1, col, { "/" })
-                if is_before_arrow() then
+                if opts.enable_close_on_slash and is_before_arrow() then
                     log.debug("is_before_arrow")
                     M.close_slash_tag()
                 end
